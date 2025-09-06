@@ -1,0 +1,184 @@
+---
+title: "BLA Take Home Task 2"
+author: "Aaron Wong"
+date: "2025-03-27"
+output: html_document
+---
+```{r}
+#install.packages("RSQLite")
+#install.packages("DBI")
+#isntall.packages("coursekata")
+library(coursekata)
+library(RSQLite)
+library(DBI)
+```
+```{r}
+con <- dbConnect(RSQLite::SQLite(), dbname = "acc1819.db")
+GamesData <- dbReadTable(con, "games")
+BoxScoreData <- dbReadTable(con, "box_scores")
+View(GamesData)
+View(BoxScoreData)
+```
+```{r}
+query <- "
+SELECT team,
+       COUNT(*) AS games_played,
+       SUM(score) AS total_points,
+       SUM(Rebounds) AS total_rebounds,
+       SUM(AST) AS total_assists,
+       SUM(TOV) AS total_TOV,
+       SUM(STL) AS total_STL,
+       SUM(BLK) AS total_BLK,
+       SUM(ORB) AS total_ORB,
+       SUM(DRB) AS total_DRB,
+       SUM(FGA) AS total_FGA,
+       SUM(FGM) AS total_FGM,
+       SUM(FTA) AS total_FTA,
+       SUM(FTM) AS total_FTM,
+       SUM(Fouls) AS total_Fouls
+FROM box_scores
+GROUP BY team
+ORDER BY total_points DESC;
+"
+team_totals <- dbGetQuery(con, query)
+team_totals$PPG <- team_totals$total_points / team_totals$games_played
+View(team_totals)
+```
+
+
+Team Efficiency rating, Team_EFF = (Points + Rebounds + Assists + Steals + Blocks) - (Missed FG + Missed FT + Turnovers)
+```{r}
+Team_EFF <- numeric(nrow(team_totals))
+for (i in 1:nrow(team_totals)) {
+  Team_EFF[i] <- (
+    team_totals$total_points[i] + team_totals$total_rebounds[i] +team_totals$total_assists[i] + team_totals$total_STL[i] + team_totals$total_BLK[i]
+  ) - ((team_totals$total_FGA[i] - team_totals$total_FGM[i]) + (team_totals$total_FTA[i] - team_totals$total_FTM[i]) + team_totals$total_TOV[i])
+}
+team_totals$Team_EFF <- Team_EFF
+EFF_Rankings <- select(team_totals, Team, Team_EFF)
+EFF_Rankings <- arrange(EFF_Rankings, desc(Team_EFF))
+print(EFF_Rankings)
+```
+Win Percentage 
+```{r}
+BoxScoreData <- BoxScoreData[order(BoxScoreData$GameId), ]
+BoxScoreData$Winner <- NA
+for (gid in unique(BoxScoreData$GameId)) {
+  rows <- which(BoxScoreData$GameId == gid)
+  if (length(rows) == 2) {
+    if (BoxScoreData$Score[rows[1]] > BoxScoreData$Score[rows[2]]) {
+      BoxScoreData$Winner[rows[1]] <- 1
+      BoxScoreData$Winner[rows[2]] <- 0
+    } else {
+      BoxScoreData$Winner[rows[1]] <- 0
+      BoxScoreData$Winner[rows[2]] <- 1
+    }
+  }
+}
+
+wins <- tapply(BoxScoreData$Winner, BoxScoreData$Team, sum)
+games <- table(BoxScoreData$Team)
+win_pct <- wins / games
+team_record <- data.frame(Team = names(win_pct), Win_Pct = as.numeric(win_pct))
+team_record
+```
+
+
+Strength Of Schedule Ratings
+```{r}
+BoxScoreData$Opponent <- NA
+for (gid in unique(BoxScoreData$GameId)) {
+  rows <- which(BoxScoreData$GameId == gid)
+  if (length(rows) == 2) {
+    BoxScoreData$Opponent[rows[1]] <- BoxScoreData$Team[rows[2]]
+    BoxScoreData$Opponent[rows[2]] <- BoxScoreData$Team[rows[1]]
+  }
+}
+win_pct_lookup <- setNames(team_record$Win_Pct, team_record$Team)
+BoxScoreData$Opponent_Win_Pct <- win_pct_lookup[BoxScoreData$Opponent]
+sos <- tapply(BoxScoreData$Opponent_Win_Pct, BoxScoreData$Team, mean, na.rm = TRUE)
+team_record$Strength_of_Schedule <- sos[team_record$Team]
+
+# Merge into team_totals
+team_totals$Win_Pct <- team_record$Win_Pct[match(team_totals$Team, team_record$Team)]
+team_totals$Strength_of_Schedule <- team_record$Strength_of_Schedule[match(team_totals$Team, team_record$Team)]
+team_totals
+```
+Monte Carlo Simulation to run simulations based off of Team Efficency ratings, win percentage, and Strength of Schedule 
+```{r}
+teams <- team_totals$Team
+eff_ratings <- team_totals$Team_EFF
+n_teams <- length(teams)
+n_simulations <- 1000
+
+sim_summary <- data.frame(
+  Team = rep(teams, each = n_simulations),
+  SimID = rep(1:n_simulations, times = n_teams),
+  Win_Pct = NA,
+  SOS = NA
+)
+
+win_probs <- matrix(NA, n_teams, n_teams)
+for (i in 1:n_teams) {
+  for (j in 1:n_teams) {
+    if (i != j) {
+      diff <- eff_ratings[i] - eff_ratings[j]
+      win_probs[i, j] <- 1 / (1 + exp(-diff / 10))
+    }
+  }
+}
+
+for (sim in 1:n_simulations) {
+  wins <- rep(0, n_teams)
+  opponents <- vector("list", n_teams)
+  for (i in 1:(n_teams - 1)) {
+    for (j in (i + 1):n_teams) {
+      prob_i <- win_probs[i, j]
+      outcome <- runif(1)
+      if (outcome < prob_i) {
+        wins[i] <- wins[i] + 1
+        opponents[[i]] <- c(opponents[[i]], j)
+        opponents[[j]] <- c(opponents[[j]], i)
+      } else {
+        wins[j] <- wins[j] + 1
+        opponents[[j]] <- c(opponents[[j]], i)
+        opponents[[i]] <- c(opponents[[i]], j)
+      }
+    }
+  }
+  for (k in 1:n_teams) {
+    games_played <- length(opponents[[k]])
+    opp_eff <- eff_ratings[unlist(opponents[[k]])]
+    row_index <- (sim - 1) * n_teams + k
+    sim_summary$Win_Pct[row_index] <- wins[k] / games_played
+    sim_summary$SOS[row_index] <- mean(opp_eff)
+  }
+}
+avg_results <- aggregate(
+cbind(Win_Pct, SOS) ~ Team,
+data = sim_summary,
+FUN = mean
+)
+avg_results$Team_EFF <- eff_ratings[match(avg_results$Team, teams)]
+normalize <- function(x) {
+(x - min(x)) / (max(x) - min(x))
+}
+avg_results$Win_Pct_Norm <- normalize(avg_results$Win_Pct)
+avg_results$SOS_Norm <- normalize(avg_results$SOS)
+avg_results$EFF_Norm <- normalize(avg_results$Team_EFF)
+avg_results$rating <- (
+0.4 * avg_results$Win_Pct_Norm +
+0.3 * avg_results$SOS_Norm +
+0.3 * avg_results$EFF_Norm
+)
+final_ranking <- avg_results[order(-avg_results$rating), ]
+final_ranking$Rank <- 1:n_teams
+final_ranking <- final_ranking[, c("Rank", "Team", "rating", "Win_Pct", "SOS", "Team_EFF")]
+View(final_ranking)
+dbDisconnect(con)
+```
+```{r}
+ACCRankings1819 <- select(final_ranking,c(Rank,Team,rating))
+ACCRankings1819
+write.csv(ACCRankings1819, "ACCRankings1819.csv", row.names = FALSE)
+```
